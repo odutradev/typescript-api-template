@@ -3,11 +3,11 @@ import fs from "fs/promises";
 
 import passwordChangedTemplate from "@email/templates/passwordChanged";
 import passwordResetTemplate from "@email/templates/passwordReset";
+import validationService from "@utils/services/validation.service"
 import passwordResetModel from "@database/model/passwordReset";
 import stringService from "@utils/services/string.services";
-import objectService from "@utils/services/object.services";
+import objectService from "@utils/services/object.service";
 import randomService from "@utils/services/random.service";
-import cryptoService from "@utils/services/crypto.service";
 import imageService from "@utils/services/image.service";
 import dateService from "@utils/services/date.service";
 import sendEmail from "@email/functions/sendEmail";
@@ -17,54 +17,86 @@ import fileStorage from "@storage/file";
 
 import type { ManageRequestBody } from "@middlewares/manageRequest";
 
-const RESET_EXPIRATION_MINUTES = 15;
-const MAX_RESET_ATTEMPTS = 3;
-const RESET_CODE_MAX = 999999;
-const RESET_CODE_MIN = 100000;
-const IMAGE_QUALITY = 80;
-const MAX_IMAGE_SIZE = 1024;
-const IMAGE_FORMAT = "webp";
+type UserModelType = any;
 
 const usersResource = {
-    signUp: async ({ data, manageError }: ManageRequestBody) => {
+    signUp: async ({ data, manageError, createLog }: ManageRequestBody) => {
         try {
-            const { id, password } = data as Record<string, string>;
-            if (!id || !password) return manageError({ code: "invalid_data" });
+            let { email, password, name } = data;
+            if (!email || !password) return manageError({ code: "invalid_data" });
 
-            const findUser = await userModel.findOne({ id });
-            if (!findUser) return manageError({ code: "user_not_found" });
-            
-            if (findUser.status !== "registered") return manageError({ code: "user_already_registered" });
+            const findUser = await userModel.findOne({ email });
+            if (findUser) return manageError({ code: "user_already_exists" });
 
-            const hashedPassword = await cryptoService.hashPassword(password);
+            const salt = await bcrypt.genSalt(10);
+            const hashedPassword = await bcrypt.hash(password, salt);
 
-            const extra: Partial<any> = {
-                firstSignup: new Date(Date.now()),
-                lastUpdate: new Date(Date.now()),
+            const now = dateService.now();
+
+            const newUser: Partial<UserModelType> = {
+                email,
                 password: hashedPassword,
+                name: name ? stringService.filterBadwords(stringService.normalizeString(name)) : undefined,
+                firstSignup: now,
+                lastUpdate: now,
                 status: "loggedIn"
             };
 
-            await userModel.findOneAndUpdate({ id }, { $set: { ...extra } }, { new: true });
+            const createdUser = await userModel.create(newUser);
 
-            const token = jwt.sign({ id: findUser._id }, process.env.SECRET || "");
+            await createLog({
+                action: "user_signup",
+                entity: "user",
+                entityID: createdUser._id.toString(),
+                userID: createdUser._id.toString(),
+                data: {
+                    email: createdUser.email,
+                    name: createdUser.name,
+                    role: createdUser.role
+                }
+            });
+
+            const template = welcomeTemplate();
+            await sendEmail({
+                to: createdUser.email as string,
+                subject: "Bem-vindo ao AMaisFacil",
+                template,
+                variables: {
+                    userName: createdUser.name || 'Usuário',
+                    email: createdUser.email as string,
+                    date: dateService.formatDate(now)
+                }
+            });
+
+            const token = jwt.sign({ id: createdUser._id }, process.env.SECRET || "");
             return { token };		 
         } catch (error) {
             manageError({ code: "internal_error", error });
         }
     },
-    signIn: async ({ data, manageError }: ManageRequestBody) => {
+    signIn: async ({ data, manageError, createLog }: ManageRequestBody) => {
         try {
-            const { id, password } = data as Record<string, string>;
-            if (!id || !password) return manageError({ code: "no_credentials_sent" });
+            let { email, password } = data;
+            if (!email || !password) return manageError({ code: "no_credentials_sent" });
 
-            const findUser = await userModel.findOne({ id });
+            const findUser = await userModel.findOne({ email });
             if (!findUser) return manageError({ code: "user_not_found" });
             
             if (findUser.status !== "loggedIn") return manageError({ code: "user_not_registered" });
 
-            const isPasswordMatch = await cryptoService.comparePassword(password, findUser?.password || "");
+            var isPasswordMatch = await bcrypt.compare(password, findUser?.password || "");
             if (!isPasswordMatch) return manageError({ code: "invalid_credentials" });
+
+            await createLog({
+                action: "user_signin",
+                entity: "user",
+                entityID: findUser._id.toString(),
+                userID: findUser._id.toString(),
+                data: {
+                    email: findUser.email,
+                    name: findUser.name
+                }
+            });
 
             const token = jwt.sign({ id: findUser._id }, process.env.SECRET || "");
             return { token };		 
@@ -72,61 +104,31 @@ const usersResource = {
             manageError({ code: "internal_error", error });
         }
     },
-    getUser: async ({ manageError, ids }: ManageRequestBody) => {
+    requestPasswordReset: async ({ data, manageError, createLog }: ManageRequestBody) => {
         try {
-            return await hasUser({ _id: ids.userID }, manageError);
-        } catch (error) {
-            manageError({ code: "internal_error", error });
-        }
-    },
-    updateProfile: async ({ data, manageError, ids }: ManageRequestBody) => {
-        try {
-            const { userID } = ids;
-            if (!userID) return manageError({ code: "invalid_params" });
-
-            const userExists = await hasUser({ _id: userID }, manageError);
-            if (!userExists) return;
-
-            const filteredUpdatedUser = objectService.getObject(data, ["name", "description"]) as Record<string, string>;
-
-            if (filteredUpdatedUser.name) {
-                filteredUpdatedUser.name = stringService.filterBadwords(stringService.normalizeString(filteredUpdatedUser.name));
-            }
-
-            if (filteredUpdatedUser.description) {
-                filteredUpdatedUser.description = stringService.filterBadwords(stringService.normalizeString(filteredUpdatedUser.description));
-            }
-
-            return await userModel.findByIdAndUpdate(userID, { $set: { ...filteredUpdatedUser, lastUpdate: Date.now() } }, { new: true }).select("-password");
-        } catch (error) {
-            manageError({ code: "internal_error", error });
-        }
-    },
-    requestPasswordReset: async ({ data, manageError }: ManageRequestBody) => {
-        try {
-            const { email } = data as Record<string, string>;
+            const { email } = data;
             if (!email) return manageError({ code: "invalid_data" });
 
             const user = await userModel.findOne({ email });
             if (!user) return manageError({ code: "user_not_found" });
 
             await passwordResetModel.deleteMany({ 
-                verified: false,
-                userID: user._id
+                userID: user._id, 
+                verified: false 
             });
 
-            const code = randomService.getRandomNumberInRange(RESET_CODE_MIN, RESET_CODE_MAX).toString();
+            const code = randomService.getRandomNumberInRange(100000, 999999).toString();
             const now = dateService.now();
-            const expiresAt = dateService.addMinutes(new Date(), RESET_EXPIRATION_MINUTES);
+            const expiresAt = dateService.addMinutes(new Date(), 15);
 
             const resetRequest = new passwordResetModel({
-                expiresAt,
-                createdAt: now,
-                verified: false,
-                email: user.email,
                 userID: user._id,
+                email: user.email,
+                code,
+                verified: false,
                 attempts: 0,
-                code
+                expiresAt,
+                createdAt: now
             });
 
             await resetRequest.save();
@@ -137,23 +139,34 @@ const usersResource = {
                 subject: "Código de redefinição de senha",
                 template,
                 variables: {
-                    expirationMinutes: RESET_EXPIRATION_MINUTES,
-                    code
+                    code,
+                    expirationMinutes: 15
+                }
+            });
+
+            await createLog({
+                action: "system_action",
+                entity: "system",
+                entityID: resetRequest._id.toString(),
+                userID: user._id.toString(),
+                data: {
+                    description: "Código de redefinição de senha enviado",
+                    email: user.email
                 }
             });
 
             return {
+                success: true,
                 message: "Código enviado para o email",
-                expiresIn: RESET_EXPIRATION_MINUTES,
-                success: true
+                expiresIn: 15
             };
         } catch (error) {
             manageError({ code: "internal_error", error });
         }
     },
-    verifyResetCode: async ({ data, manageError }: ManageRequestBody) => {
+    verifyResetCode: async ({ data, manageError, createLog }: ManageRequestBody) => {
         try {
-            const { email, code } = data as Record<string, string>;
+            const { email, code } = data;
             if (!email || !code) return manageError({ code: "invalid_data" });
 
             const user = await userModel.findOne({ email });
@@ -162,14 +175,14 @@ const usersResource = {
             const now = dateService.now();
 
             const resetRequest = await passwordResetModel.findOne({
-                expiresAt: { $gt: now },
+                userID: user._id,
                 verified: false,
-                userID: user._id
+                expiresAt: { $gt: now }
             }).sort({ createdAt: -1 });
 
             if (!resetRequest) return manageError({ code: "invalid_data" });
 
-            if (resetRequest.attempts >= MAX_RESET_ATTEMPTS) {
+            if (resetRequest.attempts >= 3) {
                 await passwordResetModel.deleteOne({ _id: resetRequest._id });
                 return manageError({ code: "invalid_data" });
             }
@@ -187,17 +200,28 @@ const usersResource = {
                 { verified: true }
             );
 
+            await createLog({
+                action: "system_action",
+                entity: "system",
+                entityID: resetRequest._id.toString(),
+                userID: user._id.toString(),
+                data: {
+                    description: "Código de redefinição verificado",
+                    email: user.email
+                }
+            });
+
             return {
-                message: "Código verificado com sucesso",
-                success: true
+                success: true,
+                message: "Código verificado com sucesso"
             };
         } catch (error) {
             manageError({ code: "internal_error", error });
         }
     },
-    resetPassword: async ({ data, manageError }: ManageRequestBody) => {
+    resetPassword: async ({ data, manageError, createLog }: ManageRequestBody) => {
         try {
-            const { email, code, newPassword } = data as Record<string, string>;
+            const { email, code, newPassword } = data;
             if (!email || !code || !newPassword) return manageError({ code: "invalid_data" });
 
             const user = await userModel.findOne({ email });
@@ -206,15 +230,16 @@ const usersResource = {
             const now = dateService.now();
 
             const resetRequest = await passwordResetModel.findOne({
-                expiresAt: { $gt: now },
-                verified: true,
                 userID: user._id,
-                code
+                code,
+                verified: true,
+                expiresAt: { $gt: now }
             }).sort({ createdAt: -1 });
 
             if (!resetRequest) return manageError({ code: "invalid_data" });
 
-            const hashedPassword = await cryptoService.hashPassword(newPassword);
+            const salt = await bcrypt.genSalt(10);
+            const hashedPassword = await bcrypt.hash(newPassword, salt);
 
             await userModel.findByIdAndUpdate(
                 user._id,
@@ -232,26 +257,94 @@ const usersResource = {
                 subject: "Senha alterada com sucesso",
                 template,
                 variables: {
-                    time: dateService.formatTime(now),
+                    userName: user.name || 'Usuário',
                     date: dateService.formatDate(now),
-                    userName: user.name || "Usuário"
+                    time: dateService.formatTime(now)
+                }
+            });
+
+            await createLog({
+                action: "system_action",
+                entity: "system",
+                entityID: user._id.toString(),
+                userID: user._id.toString(),
+                data: {
+                    description: "Senha redefinida com sucesso",
+                    email: user.email
                 }
             });
 
             return {
-                message: "Senha alterada com sucesso",
-                success: true
+                success: true,
+                message: "Senha alterada com sucesso"
             };
         } catch (error) {
             manageError({ code: "internal_error", error });
         }
     },
-    updateProfileImage: async ({ manageError, ids, files }: ManageRequestBody) => {
+    getUser: async ({  manageError, ids }: ManageRequestBody) => {
+        try {
+            return await hasUser({ _id: ids.userID }, manageError);
+        } catch (error) {
+            manageError({ code: "internal_error", error });
+        }
+    },
+    updateProfile: async ({  data, manageError, ids, createLog }: ManageRequestBody) => {
+        try {
+            const { userID } =  ids;
+            if (!userID) return manageError({ code: "invalid_params" });
+
+            const userExists = await hasUser({ _id: userID }, manageError);
+            if (!userExists) return;
+
+            let filteredUpdatedUser = objectService.getObject(data, ["name", "description", "cpfOrRg"]);
+
+            if (filteredUpdatedUser.name){
+                filteredUpdatedUser.name = stringService.filterBadwords(stringService.normalizeString(filteredUpdatedUser.name));
+            };
+
+            if (filteredUpdatedUser.description){
+                filteredUpdatedUser.description = stringService.filterBadwords(stringService.normalizeString(filteredUpdatedUser.description));
+            };
+
+            if (filteredUpdatedUser.cpfOrRg !== undefined) {
+                const cleanCpfOrRg = filteredUpdatedUser.cpfOrRg.trim();
+                
+                if (cleanCpfOrRg && !validationService.validateCPForRG(cleanCpfOrRg)) {
+                    return manageError({ code: "author_invalid_cpf_rg" });
+                }
+                
+                filteredUpdatedUser.cpfOrRg = cleanCpfOrRg || null;
+            }
+
+            const updatedUser = await userModel.findByIdAndUpdate(
+                userID, 
+                { $set:{ ...filteredUpdatedUser, lastUpdate: dateService.now() } }, 
+                { new: true }
+            ).select("-password");
+
+            await createLog({
+                action: "user_updated",
+                entity: "user",
+                entityID: userID,
+                userID: userID,
+                data: {
+                    email: updatedUser?.email,
+                    name: updatedUser?.name,
+                    updatedFields: Object.keys(filteredUpdatedUser)
+                }
+            });
+
+            return updatedUser;
+        } catch (error) {
+            manageError({ code: "internal_error", error });
+        }
+    },
+    updateProfileImage: async ({ manageError, ids, file, createLog }: ManageRequestBody) => {
         try {
             const { userID } = ids;
             if (!userID) return manageError({ code: "invalid_params" });
 
-            const file = files[0];
             if (!file) return manageError({ code: "invalid_data" });
 
             const user = await hasUser({ _id: userID }, manageError);
@@ -260,27 +353,32 @@ const usersResource = {
             const { mimetype, path } = file;
 
             if (!mimetype || !path) return manageError({ code: "invalid_data" });
-            if (!mimetype.startsWith("image/")) return manageError({ code: "invalid_data" });
+
+            if (!mimetype.startsWith('image/')) {
+                return manageError({ code: "invalid_data" });
+            }
 
             const originalBuffer = await fs.readFile(path);
+
             const isValidImage = await imageService.validateImage(originalBuffer);
-            
-            if (!isValidImage) return manageError({ code: "invalid_data" });
+            if (!isValidImage) {
+                return manageError({ code: "invalid_data" });
+            }
 
             const { buffer: compressedBuffer, mimeType, originalSize, compressedSize, compressionRatio } = await imageService.compressImage({
-                maxHeight: MAX_IMAGE_SIZE,
-                maxWidth: MAX_IMAGE_SIZE,
-                quality: IMAGE_QUALITY,
-                format: IMAGE_FORMAT,
-                buffer: originalBuffer
+                buffer: originalBuffer,
+                maxWidth: 1024,
+                maxHeight: 1024,
+                quality: 80,
+                format: "webp"
             });
 
             const filePath = `users/${userID}/images/profile`;
             
             const { url } = await fileStorage.upload({
+                path: filePath,
                 buffer: compressedBuffer,
                 mimeType,
-                path: filePath,
                 isPublic: true
             });
 
@@ -288,21 +386,158 @@ const usersResource = {
                 userID,
                 { 
                     $set: { 
-                        "images.profile": url,
+                        'images.profile': url,
                         lastUpdate: dateService.now()
                     }
                 },
                 { new: true }
             ).select("-password");
 
-            return {
-                user: updatedUser,
-                url,
-                compression: {
-                    savedBytes: originalSize - compressedSize,
-                    compressionRatio: `${compressionRatio.toFixed(2)}%`,
+            await createLog({
+                action: "user_updated",
+                entity: "user",
+                entityID: userID,
+                userID,
+                data: {
+                    description: "Foto de perfil atualizada com compressão",
+                    imageUrl: url,
+                    originalSize,
                     compressedSize,
-                    originalSize
+                    compressionRatio: `${compressionRatio.toFixed(2)}%`,
+                    savedBytes: originalSize - compressedSize
+                }
+            });
+
+            return {
+                url,
+                user: updatedUser,
+                compression: {
+                    originalSize,
+                    compressedSize,
+                    compressionRatio: `${compressionRatio.toFixed(2)}%`,
+                    savedBytes: originalSize - compressedSize
+                }
+            };
+        } catch (error) {
+            manageError({ code: "internal_error", error });
+        }
+    },
+    updateUserById: async ({ data, manageError, params, ids, createLog }: ManageRequestBody) => {
+        try {
+            const { userID } =  params;
+            if (!userID) return manageError({ code: "invalid_params" });
+
+            const userExists = await hasUser({ _id: userID }, manageError);
+            if (!userExists) return;
+
+            const filteredUser = objectService.filterObject(data, ["id", "order", "role", "createAt", "password", "_id"]);
+
+            if (filteredUser.name){
+                filteredUser.name = stringService.normalizeString(filteredUser.name);
+            };
+
+            if (filteredUser.description){
+                filteredUser.description = stringService.normalizeString(filteredUser.description);
+            };
+
+            if (filteredUser.cpfOrRg !== undefined) {
+                const cleanCpfOrRg = filteredUser.cpfOrRg.trim();
+                
+                if (cleanCpfOrRg && !validationService.validateCPForRG(cleanCpfOrRg)) {
+                    return manageError({ code: "author_invalid_cpf_rg" });
+                }
+                
+                filteredUser.cpfOrRg = cleanCpfOrRg || null;
+            }
+
+            const updatedUser = await userModel.findByIdAndUpdate(
+                userID, 
+                { $set:{ ...filteredUser, lastUpdate: dateService.now() } }, 
+                { new: true }
+            ).select("-password");
+
+            await createLog({
+                action: "user_updated",
+                entity: "user",
+                entityID: userID,
+                userID: ids.userID,
+                data: {
+                    email: updatedUser?.email,
+                    name: updatedUser?.name,
+                    updatedFields: Object.keys(filteredUser),
+                    updatedBy: ids.userID
+                },
+                additionalInfo: { adminUpdate: true }
+            });
+
+            return updatedUser;
+        } catch (error) {
+            console.log('DEBUG', error)
+            manageError({ code: "internal_error", error });
+        }
+    },
+    deleteUserById: async ({ manageError, params, ids, createLog }: ManageRequestBody) => {
+        try {
+            const { userID } =  params;
+            if (!userID) return manageError({ code: "invalid_params" });
+
+            const user = await hasUser({ _id: userID }, manageError);
+            if (!user) return;
+            
+            await userModel.findByIdAndDelete(userID);
+
+            await createLog({
+                action: "user_deleted",
+                entity: "user",
+                entityID: userID,
+                userID: ids.userID,
+                data: {
+                    email: user.email,
+                    name: user.name,
+                    deletedBy: ids.userID
+                }
+            });
+            
+            return {
+                delete: true
+            };
+        } catch (error) {
+            manageError({ code: "internal_error", error });
+        }
+    },
+    getUserById: async ({ manageError, params }: ManageRequestBody) => {
+        try {
+            const { userID } =  params;
+            if (!userID) return manageError({ code: "invalid_params" });
+
+           return await hasUser({ _id: userID }, manageError);
+        } catch (error) {
+            manageError({ code: "internal_error", error });
+        }
+    },
+    getAllUsers: async ({ manageError, querys }: ManageRequestBody) => {
+        try {
+            const pageNum = Number(querys.page) || 1;
+            const limitNum = Number(querys.limit) || 10;
+            const returnType = querys.returnType || "full";
+
+            if (pageNum < 1 || limitNum < 1) return manageError({ code: "invalid_params" });
+    
+            const skip = (pageNum - 1) * limitNum;
+            const [users, total] = await Promise.all([
+                userModel.find().sort({ createAt: -1 }).skip(skip).limit(limitNum).select('-password'),
+                userModel.countDocuments()
+            ]);
+
+            const data = returnType == "minimum" ? users.map(x => ({ _id: x._id, name: x.name, email: x.email })): users;
+    
+            return {
+                data,
+                meta: {
+                    total,
+                    page: pageNum,
+                    pages: Math.ceil(total / limitNum),
+                    limit: limitNum
                 }
             };
         } catch (error) {

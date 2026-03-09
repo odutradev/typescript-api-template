@@ -1,7 +1,7 @@
 import { hasUser, hasExistsUser } from "@database/functions/user";
 import { ManageRequestBody } from "@middlewares/manageRequest";
 import stringService from "@utils/services/string.services";
-import objectService from "@utils/services/object.services";
+import objectService from "@utils/services/object.service";
 import userModel from "@database/model/user";
 
 const adminResource = {
